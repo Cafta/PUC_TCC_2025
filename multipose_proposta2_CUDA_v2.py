@@ -5,15 +5,13 @@ import time
 from collections import defaultdict
 from ultralytics import YOLO
 
-ip = "http:192.168.15.34:8080/video"  # IP da câmera (mude conforme necessário)
+ip = "http:192.168.15.35:8080/video"  # IP da câmera (mude conforme necessário)
 
 cap = cv2.VideoCapture(ip)
 
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 384)
-width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-print(f"Tamanho real dos frames de entrada: {int(width)}x{int(height)}")
+# width = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+# height = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+# print(f"Tamanho real dos frames de entrada: {int(width)}x{int(height)}")
 
 
 class MultiPersonCommandDetector:
@@ -191,34 +189,49 @@ class MultiPersonCommandDetector:
             landmarks = pose_results.pose_landmarks.landmark
             
             # Verificar se pulso está acima do ombro
-            left_wrist = landmarks[15]  # Left wrist
-            right_wrist = landmarks[16]  # Right wrist
-            left_shoulder = landmarks[11]  # Left shoulder
+            left_wrist = landmarks[15]      # Left wrist
+            right_wrist = landmarks[16]     # Right wrist
+            left_elbow = landmarks[13]      # cotovelo esquerdo // usado para calcular a escala do boundingbox.
+            right_elbow = landmarks[14]     # cotovelo direito  // usado para calcular a escala do boundingbox.
+            left_shoulder = landmarks[11]   # Left shoulder
             right_shoulder = landmarks[12]  # Right shoulder
-            
-            # Mão esquerda levantada
-            if left_wrist.y < left_shoulder.y - 0.15:  # Threshold maior
-                hand_x = x1 + int(left_wrist.x * (x2-x1) / scale)
-                hand_y = y1 + int(left_wrist.y * (y2-y1) / scale)
-                return True, 'left', (hand_x, hand_y)
-            
-            # Mão direita levantada
-            if right_wrist.y < right_shoulder.y - 0.15:  # Threshold maior
-                hand_x = x1 + int(right_wrist.x * (x2-x1) / scale)
-                hand_y = y1 + int(right_wrist.y * (y2-y1) / scale)
-                return True, 'right', (hand_x, hand_y)
+
+            if left_wrist.y < left_shoulder.y - 0.15:
+                hand_x = x1 + int(left_wrist.x * (x2 - x1))
+                hand_y = y1 + int(left_wrist.y * (y2 - y1))
+
+                # Escala baseada no comprimento do antebraço
+                escala = np.sqrt(
+                    (left_wrist.x - left_elbow.x) ** 2 +
+                    (left_wrist.y - left_elbow.y) ** 2
+                )
+                return True, 'left', (hand_x, hand_y), escala
         
-        return False, None, None
+            if right_wrist.y < right_shoulder.y - 0.15:
+                hand_x = x1 + int(right_wrist.x * (x2 - x1))
+                hand_y = y1 + int(right_wrist.y * (y2 - y1))
+
+                escala = np.sqrt(
+                    (right_wrist.x - right_elbow.x) ** 2 +
+                    (right_wrist.y - right_elbow.y) ** 2
+                )
+                return True, 'right', (hand_x, hand_y), escala
+
+        return False, None, None, None
     
-    def create_hand_roi(self, hand_position, frame_shape):
+    def create_hand_roi(self, hand_position, frame_shape, escala):
         """Cria ROI ao redor da mão detectada"""
         x, y = hand_position
-        roi_size = 150  # pixels
+
+        if escala is None:
+            roi_size = 120  # fallback
+        else:
+            roi_size = int(max(60, min(escala * frame_shape[0] * 1.2, 180)))    # entre 1.2 e 2.0
         
         x1 = max(0, x - roi_size//2)
         y1 = max(0, y - roi_size//2)
         x2 = min(frame_shape[1], x + roi_size//2)
-        y2 = min(frame_shape[0], y + roi_size//2)
+        y2 = min(frame_shape[0], y + roi_size//1.9)
         
         return [x1, y1, x2, y2]
     
@@ -231,8 +244,9 @@ class MultiPersonCommandDetector:
             return None
         
         # Redimensionar ROI para processamento mais rápido
-        if hand_roi.shape[1] > 128:
-            hand_roi = cv2.resize(hand_roi, (128, 128))
+        # if hand_roi.shape[1] > 128:
+        #     hand_roi = cv2.resize(hand_roi, (128, 128))
+        hand_roi = cv2.resize(hand_roi, (128, 128))
         
         rgb_roi = cv2.cvtColor(hand_roi, cv2.COLOR_BGR2RGB)
         hand_results = self.mp_hands.process(rgb_roi)
@@ -367,10 +381,10 @@ class MultiPersonCommandDetector:
             
             # Etapa 2: Procurar primeira pessoa que levanta a mão
             for person in tracked_persons:
-                has_raised_hand, hand_side, hand_pos = self.check_raised_hand(frame, person)
+                has_raised_hand, hand_side, hand_pos, escala = self.check_raised_hand(frame, person)
                 if has_raised_hand:
                     self.active_person_id = person['id']
-                    self.active_hand_roi = self.create_hand_roi(hand_pos, frame.shape)
+                    self.active_hand_roi = self.create_hand_roi(hand_pos, frame.shape, escala)
                     self.state = "PROCESSING"
                     self.command_start_time = current_time
                     self.hand_positions_history = []
